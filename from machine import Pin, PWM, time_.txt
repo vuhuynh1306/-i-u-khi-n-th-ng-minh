@@ -1,0 +1,708 @@
+from machine import Pin, PWM, time_pulse_us
+import time
+
+
+# =========================================================
+# 1. KHAI BÁO PHẦN CỨNG
+# =========================================================
+
+# ---------------- L298N ----------------
+ENA = PWM(Pin(25))
+
+IN1 = Pin(13, Pin.OUT)
+IN2 = Pin(14, Pin.OUT)
+
+IN3 = Pin(16, Pin.OUT)
+IN4 = Pin(17, Pin.OUT)
+
+ENB = PWM(Pin(26))
+
+ENA.freq(1000)
+ENB.freq(1000)
+
+
+# ---------------- SERVO SG90 ----------------
+servo = PWM(Pin(18))
+servo.freq(50)
+
+
+# ---------------- HC-SR04 ----------------
+TRIG = Pin(4, Pin.OUT)
+ECHO = Pin(5, Pin.IN)
+
+# HC-SR04 ECHO
+#      ↓
+# HCMCU B4
+#      ↓
+# HCMCU A4
+#      ↓
+# ESP32 GPIO5
+
+
+# =========================================================
+# 2. THÔNG SỐ XE
+# =========================================================
+
+DEBUG = True
+
+# Khoảng cách bắt đầu tránh vật cản
+GIOI_HAN = 20       # cm
+
+# Bắt đầu giảm tốc
+NGUONG_GIAM_TOC = 25    # cm
+
+# Vùng rất gần
+NGUY_HIEM = 10      # cm
+
+
+# ---------------- TỐC ĐỘ ----------------
+
+# Tốc độ bình thường khi đường phía trước thoáng
+TOC_DO = 70
+
+# Tốc độ khi còn cách vật cản 20–25 cm
+TOC_DO_CHAM = 40
+
+# Tốc độ khi quay
+TOC_QUAY = 55
+
+
+# ---------------- GÓC SERVO ----------------
+
+GOC_GIUA = 90
+GOC_TRAI = 150
+GOC_PHAI = 30
+
+
+# ---------------- THỜI GIAN ----------------
+
+# Thời gian lùi khi cả hai bên đều bị chặn
+T_LUI = 300       # ms
+
+# Thời gian quay khoảng 90 độ
+T_QUAY = 500      # ms
+
+# Thời gian quay đầu
+T_QUAY_DAU = 950  # ms
+
+# Thời gian chạy ra khỏi vùng vật cản sau khi quay
+T_THOAT = 350     # ms
+
+
+# Độ chênh lệch để lựa chọn hướng
+DO_LECH_HUONG = 8
+
+# Khoảng cách đo tối đa
+MAX_CM = 400
+
+
+# =========================================================
+# 3. HIỂN THỊ THÔNG TIN
+# =========================================================
+
+def log(*args):
+
+    if DEBUG:
+        print(*args)
+
+
+# =========================================================
+# 4. ĐIỀU KHIỂN PWM MOTOR
+# =========================================================
+
+def toc_do(pwm, phan_tram):
+
+    phan_tram = max(
+        0,
+        min(100, phan_tram)
+    )
+
+    duty = int(
+        phan_tram * 65535 / 100
+    )
+
+    pwm.duty_u16(duty)
+
+
+# =========================================================
+# 5. ĐIỀU KHIỂN 1 BÁNH
+# =========================================================
+
+def banh(in_a, in_b, pwm, toc):
+
+    # ---------------- TIẾN ----------------
+
+    if toc > 0:
+
+        in_a.value(0)
+        in_b.value(1)
+
+
+    # ---------------- LÙI ----------------
+
+    elif toc < 0:
+
+        in_a.value(1)
+        in_b.value(0)
+
+
+    # ---------------- DỪNG ----------------
+
+    else:
+
+        in_a.value(0)
+        in_b.value(0)
+
+
+    toc_do(
+        pwm,
+        abs(toc)
+    )
+
+
+# =========================================================
+# 6. ĐIỀU KHIỂN 2 BÁNH
+# =========================================================
+
+def lai(trai, phai):
+
+    banh(
+        IN1,
+        IN2,
+        ENA,
+        trai
+    )
+
+    banh(
+        IN3,
+        IN4,
+        ENB,
+        phai
+    )
+
+
+# =========================================================
+# 7. CÁC CHUYỂN ĐỘNG
+# =========================================================
+
+def di_thang():
+
+    log(">>> DI THANG - 70%")
+
+    lai(
+        TOC_DO,
+        TOC_DO
+    )
+
+
+def di_thang_cham():
+
+    log(">>> DI CHAM - 40%")
+
+    lai(
+        TOC_DO_CHAM,
+        TOC_DO_CHAM
+    )
+
+
+def di_lui():
+
+    log("<<< DI LUI")
+
+    lai(
+        -TOC_DO_CHAM,
+        -TOC_DO_CHAM
+    )
+
+
+def quay_trai():
+
+    log("<<< QUAY TRAI")
+
+    lai(
+        -TOC_QUAY,
+        TOC_QUAY
+    )
+
+
+def quay_phai():
+
+    log(">>> QUAY PHAI")
+
+    lai(
+        TOC_QUAY,
+        -TOC_QUAY
+    )
+
+
+def dung_lai():
+
+    lai(
+        0,
+        0
+    )
+
+
+# =========================================================
+# 8. ĐIỀU KHIỂN SERVO
+# =========================================================
+
+def servo_goc(goc):
+
+    goc = max(
+        0,
+        min(180, goc)
+    )
+
+    # 0.5 ms → 0°
+    # 2.5 ms → 180°
+
+    min_duty = 1638
+    max_duty = 8192
+
+    duty = int(
+        min_duty
+        +
+        (goc / 180)
+        *
+        (max_duty - min_duty)
+    )
+
+    servo.duty_u16(duty)
+
+
+# =========================================================
+# 9. ĐO HC-SR04 MỘT LẦN
+# =========================================================
+
+def do_mot_lan():
+
+    # Tạo xung TRIG
+    TRIG.value(0)
+
+    time.sleep_us(2)
+
+    TRIG.value(1)
+
+    time.sleep_us(10)
+
+    TRIG.value(0)
+
+
+    try:
+
+        t = time_pulse_us(
+            ECHO,
+            1,
+            30000
+        )
+
+    except Exception:
+
+        return None
+
+
+    # Không nhận được Echo
+    if t < 0:
+
+        return None
+
+
+    # Tính khoảng cách
+    distance = t / 58.0
+
+
+    # Khoảng cách không hợp lệ
+    if distance <= 0:
+
+        return None
+
+
+    # Giới hạn tối đa
+    if distance > MAX_CM:
+
+        distance = MAX_CM
+
+
+    return distance
+
+
+# =========================================================
+# 10. ĐO NHIỀU LẦN VÀ LỌC NHIỄU
+# =========================================================
+
+def do_khoang_cach():
+
+    ds = []
+
+
+    # Đo 7 lần
+    for i in range(7):
+
+        d = do_mot_lan()
+
+
+        if d is not None:
+
+            ds.append(d)
+
+
+        time.sleep_ms(10)
+
+
+    # Không có lần đo hợp lệ
+    if len(ds) == 0:
+
+        return None
+
+
+    # Sắp xếp
+    ds.sort()
+
+
+    # Lấy giá trị trung vị
+    trung_vi = ds[
+        len(ds) // 2
+    ]
+
+
+    return int(trung_vi)
+
+
+# =========================================================
+# 11. QUÉT TRÁI - PHẢI
+# =========================================================
+
+def quet_huong():
+
+    # =====================================================
+    # QUÉT TRÁI
+    # =====================================================
+
+    log("Servo -> TRAI")
+
+    servo_goc(
+        GOC_TRAI
+    )
+
+    time.sleep_ms(600)
+
+    trai = do_khoang_cach()
+
+
+    # =====================================================
+    # QUÉT PHẢI
+    # =====================================================
+
+    log("Servo -> PHAI")
+
+    servo_goc(
+        GOC_PHAI
+    )
+
+    time.sleep_ms(700)
+
+    phai = do_khoang_cach()
+
+
+    # =====================================================
+    # VỀ GIỮA
+    # =====================================================
+
+    servo_goc(
+        GOC_GIUA
+    )
+
+    time.sleep_ms(300)
+
+
+    # Nếu lỗi đo → coi như hướng bị chặn
+    if trai is None:
+
+        trai = 0
+
+
+    if phai is None:
+
+        phai = 0
+
+
+    log(
+        "TRAI:",
+        trai,
+        "cm | PHAI:",
+        phai,
+        "cm"
+    )
+
+
+    return trai, phai
+
+
+# =========================================================
+# 12. XỬ LÝ VẬT CẢN
+# =========================================================
+
+def ne_vat_can():
+
+    log("")
+    log("==============================")
+    log("PHAT HIEN VAT CAN")
+    log("==============================")
+
+
+    # =====================================================
+    # BƯỚC 1: DỪNG
+    # =====================================================
+
+    dung_lai()
+
+    time.sleep_ms(150)
+
+
+    # =====================================================
+    # BƯỚC 2: QUÉT TRÁI / PHẢI
+    # =====================================================
+
+    trai, phai = quet_huong()
+
+
+    log(
+        "KET QUA:",
+        "TRAI =", trai,
+        "| PHAI =", phai
+    )
+
+
+    # =====================================================
+    # BƯỚC 3:
+    # ÍT NHẤT MỘT BÊN CÒN THOÁNG
+    # =====================================================
+
+    if (
+        trai > GIOI_HAN
+        or
+        phai > GIOI_HAN
+    ):
+
+
+        # -------------------------------------------------
+        # TRÁI RỘNG HƠN
+        # -------------------------------------------------
+
+        if trai > phai:
+
+            log("=> CHON TRAI")
+
+            quay_trai()
+
+            time.sleep_ms(
+                T_QUAY
+            )
+
+
+        # -------------------------------------------------
+        # PHẢI RỘNG HƠN
+        # -------------------------------------------------
+
+        else:
+
+            log("=> CHON PHAI")
+
+            quay_phai()
+
+            time.sleep_ms(
+                T_QUAY
+            )
+
+
+        # Dừng sau khi quay
+        dung_lai()
+
+        time.sleep_ms(100)
+
+
+        # Chạy tiến để thoát khỏi vùng vật cản
+        di_thang()
+
+        time.sleep_ms(
+            T_THOAT
+        )
+
+
+        dung_lai()
+
+
+    # =====================================================
+    # BƯỚC 4:
+    # CẢ HAI BÊN ĐỀU BỊ CHẶN
+    # =====================================================
+
+    else:
+
+        log(
+            "=> HAI BEN DEU BI CHAN"
+        )
+
+
+        # Chỉ trường hợp này mới lùi
+        di_lui()
+
+        time.sleep_ms(
+            T_LUI
+        )
+
+
+        dung_lai()
+
+        time.sleep_ms(150)
+
+
+        # Quay đầu
+        quay_phai()
+
+        time.sleep_ms(
+            T_QUAY_DAU
+        )
+
+
+        dung_lai()
+
+        time.sleep_ms(150)
+
+
+    # Servo về giữa
+    servo_goc(
+        GOC_GIUA
+    )
+
+    time.sleep_ms(100)
+
+
+# =========================================================
+# 13. KHỞI ĐỘNG
+# =========================================================
+
+dung_lai()
+
+
+servo_goc(
+    GOC_GIUA
+)
+
+
+time.sleep_ms(1000)
+
+
+print("")
+print("==============================")
+print("       XE TU HANH ESP32")
+print("==============================")
+print("Nguong vat can :", GIOI_HAN, "cm")
+print("Nguong giam toc:", NGUONG_GIAM_TOC, "cm")
+print("Toc do binh thuong:", TOC_DO, "%")
+print("Toc do cham:", TOC_DO_CHAM, "%")
+print("Toc do quay:", TOC_QUAY, "%")
+print("==============================")
+print("")
+
+
+# =========================================================
+# 14. VÒNG LẶP CHÍNH
+# =========================================================
+
+try:
+
+    while True:
+
+
+        # -------------------------------------------------
+        # ĐO KHOẢNG CÁCH PHÍA TRƯỚC
+        # -------------------------------------------------
+
+        d = do_khoang_cach()
+
+
+        # =================================================
+        # LỖI CẢM BIẾN
+        # =================================================
+
+        if d is None:
+
+            log(
+                "LOI CAM BIEN -> DUNG"
+            )
+
+
+            dung_lai()
+
+            time.sleep_ms(200)
+
+            continue
+
+
+        log(
+            "TRUOC:",
+            d,
+            "cm"
+        )
+
+
+        # =================================================
+        # XA HƠN 25 CM
+        # → CHẠY 70%
+        # =================================================
+
+        if d > NGUONG_GIAM_TOC:
+
+            di_thang()
+
+
+        # =================================================
+        # TỪ 20 ĐẾN 25 CM
+        # → GIẢM TỐC 40%
+        # =================================================
+
+        elif d > GIOI_HAN:
+
+            di_thang_cham()
+
+
+        # =================================================
+        # ≤ 20 CM
+        # → DỪNG VÀ NÉ
+        # =================================================
+
+        else:
+
+            ne_vat_can()
+
+
+        time.sleep_ms(50)
+
+
+# =========================================================
+# 15. DỪNG AN TOÀN
+# =========================================================
+
+except KeyboardInterrupt:
+
+    print("")
+    print("DUNG BOI NGUOI DUNG")
+
+
+finally:
+
+    # Tắt motor
+    dung_lai()
+
+
+    # Servo về giữa
+    servo_goc(
+        GOC_GIUA
+    )
+
+
+    print(
+        "XE DA DUNG AN TOAN"
+    )
